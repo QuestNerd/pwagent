@@ -1,0 +1,1 @@
+Make me a complete daycare management app that works for parents, employees and managers and an owner would be able to use to completely maintain a daycare. It must have everything needed to maintain a professional daycare and must be robust and easy to use for parents as well as the owner.

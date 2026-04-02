@@ -1,0 +1,10 @@
+{
+  "id": "bec59833-9147-4793-a99a-8ce22ff5cfbb",
+  "timestamp": "2026-04-02T20:37:51.143986",
+  "source": "environment",
+  "key": "security_analyzer",
+  "value": {
+    "kind": "LLMSecurityAnalyzer"
+  },
+  "kind": "ConversationStateUpdateEvent"
+}

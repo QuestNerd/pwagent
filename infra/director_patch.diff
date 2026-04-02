@@ -1,0 +1,184 @@
+--- a/app.py
++++ b/app.py
+@@ -1,10 +1,12 @@
+ import os
+ import re
+ import json
+ import time
++import asyncio
+ import httpx
+ from typing import Any, Dict, List, Optional, Tuple
+ from fastapi import FastAPI, Request
+-from fastapi.responses import JSONResponse
++from fastapi.responses import JSONResponse
+
+ app = FastAPI()
+
+@@ -16,8 +18,11 @@
+ # ============================================================
+
+-BASE_5090 = os.getenv("BASE_5090", "http://host.docker.internal:11436/v1")
+-BASE_3090 = os.getenv("BASE_3090", "http://host.docker.internal:11435/v1")
++# IMPORTANT:
++# Your Ollama docker containers DO NOT expose /v1/chat/completions (you verified 404).
++# So these must be ROOTS like http://ollama_3090:11434 and we call /api/chat.
++BASE_5090 = os.getenv("BASE_5090", "http://ollama_5090:11434")
++BASE_3090 = os.getenv("BASE_3090", "http://ollama_3090:11434")
+
+ MODEL_MAIN_CODER = os.getenv("MODEL_MAIN_CODER", "qwen3-coder-next:latest")      # 5090
+ MODEL_DEBUGGER   = os.getenv("MODEL_DEBUGGER",   "deepseek-r1:8b")              # 3090
+@@ -118,43 +123,129 @@
+     return False
+
+-async def call_openai(
+-    base_url: str,
+-    model: str,
+-    role_prompt: str,
+-    user_messages: List[Dict[str, Any]],
+-    temperature: float = 0.2,
+-    tag: str = ""
+-) -> str:
+-    """
+-    All specialist calls include SYS_DIRECTOR + role prompt to enforce orchestration rules.
+-    """
+-    if tag:
+-        log(tag)
+-
+-    payload = {
+-        "model": model,
+-        "messages": [
+-            {"role": "system", "content": SYS_DIRECTOR},
+-            {"role": "system", "content": role_prompt},
+-            *user_messages
+-        ],
+-        "temperature": temperature,
+-    }
+-
+-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+-        r = await client.post(f"{base_url}/chat/completions", json=payload)
+-        r.raise_for_status()
+-        data = r.json()
+-        return (data["choices"][0]["message"]["content"] or "").strip()
++def _ollama_chat_url(base_url: str) -> str:
++    return base_url.rstrip("/") + "/api/chat"
++
++def _format_messages(role_prompt: str, user_messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
++    # Ollama accepts OpenAI-style messages (role/content).
++    msgs: List[Dict[str, str]] = [
++        {"role": "system", "content": SYS_DIRECTOR},
++        {"role": "system", "content": role_prompt},
++    ]
++    for m in user_messages:
++        role = (m.get("role") or "").strip()
++        content = m.get("content")
++        if not role or content is None:
++            continue
++        msgs.append({"role": role, "content": str(content)})
++    return msgs
++
++async def _post_with_retries(client: httpx.AsyncClient, url: str, json_body: Dict[str, Any], tag: str) -> Dict[str, Any]:
++    # Simple, deterministic retry (network/timeouts/5xx)
++    last_err: Optional[Exception] = None
++    for attempt in range(1, 4):
++        try:
++            r = await client.post(url, json=json_body)
++            # If Ollama is still loading a model, it can 5xx; treat as retryable.
++            if 500 <= r.status_code < 600:
++                raise httpx.HTTPStatusError(f"{r.status_code} {r.text}", request=r.request, response=r)
++            r.raise_for_status()
++            return r.json()
++        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as e:
++            last_err = e
++            log(f"{tag} attempt {attempt}/3 failed: {e}")
++            if attempt < 3:
++                await asyncio.sleep(0.5 * attempt)
++    raise last_err or RuntimeError("unknown error")
++
++async def call_llm(
++    base_url: str,
++    model: str,
++    role_prompt: str,
++    user_messages: List[Dict[str, Any]],
++    temperature: float = 0.2,
++    tag: str = ""
++) -> str:
++    """
++    Robust internal LLM call.
++    - Uses Ollama native /api/chat (since your containers return 404 on /v1/chat/completions).
++    - Retries transient failures.
++    - Never returns empty content silently.
++    """
++    if tag:
++        log(tag)
++
++    msgs = _format_messages(role_prompt, user_messages)
++    payload = {
++        "model": model,
++        "messages": msgs,
++        "stream": False,
++        "options": {"temperature": float(temperature)},
++    }
++
++    url = _ollama_chat_url(base_url)
++    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
++        try:
++            data = await _post_with_retries(client, url, payload, tag=tag or "LLM_CALL")
++            content = ((data.get("message") or {}).get("content") or "").strip()
++            if content:
++                return content
++            # If Ollama returns empty, surface the whole response (this prevents “blank director”).
++            return f"[LLM_RETURNED_EMPTY] model={model} base={base_url} raw={json.dumps(data, ensure_ascii=False)[:2000]}"
++        except Exception as e:
++            return f"[LLM_CALL_FAILED] model={model} base={base_url} err={repr(e)}"
+
+@@ -205,7 +296,7 @@
+     if is_condense(messages):
+-        text = await call_openai(
++        text = await call_llm(
+             base_url=BASE_3090,
+             model=MODEL_FAST,
+             role_prompt=ROLE_FAST,
+@@ -307,7 +398,7 @@
+     if state["phase"] == "INTAKE":
+-        creative = await call_openai(
++        creative = await call_llm(
+             base_url=BASE_3090,
+             model=MODEL_CREATIVE,
+             role_prompt=ROLE_CREATIVE,
+@@ -319,7 +410,7 @@
+         )
+-        research = await call_openai(
++        research = await call_llm(
+             base_url=BASE_3090,
+             model=MODEL_RESEARCH,
+             role_prompt=ROLE_RESEARCH,
+@@ -379,7 +470,7 @@
+     elif state["phase"] == "SPEC":
+-        archivist = await call_openai(
++        archivist = await call_llm(
+             base_url=BASE_3090,
+             model=MODEL_ARCHIVIST,
+             role_prompt=ROLE_ARCHIVIST + f"\n\nUse this team handoff:\n{state.get('handoff','')}",
+@@ -454,7 +545,7 @@
+             if ci_text.strip() and not ci_passed(ci_text):
+                 state["phase"] = "DEBUG"
+-                dbg = await call_openai(
++                dbg = await call_llm(
+                     base_url=BASE_3090,
+                     model=MODEL_DEBUGGER,
+                     role_prompt=ROLE_DEBUGGER,
+@@ -485,7 +576,7 @@
+             else:
+                 state["phase"] = "IMPLEMENT"
+-                coder = await call_openai(
++                coder = await call_llm(
+                     base_url=BASE_5090,
+                     model=MODEL_MAIN_CODER,
+                     role_prompt=ROLE_MAIN_CODER + f"\n\nRepo path is {repo}. Current handoff/context:\n{state.get('handoff','')}",
+@@ -533,7 +624,7 @@
+     elif state["phase"] == "FINAL_REVIEW":
+-        reviewer = await call_openai(
++        reviewer = await call_llm(
+             base_url=BASE_3090,
+             model=MODEL_DEBUGGER,  # using debugger as strict reviewer
+             role_prompt=ROLE_DEBUGGER,

@@ -1,0 +1,7 @@
+# OpenHands state — secrets and database don't belong in git
+openhands-state/.jwt_secret
+openhands-state/.keys
+openhands-state/openhands.db
+
+# Windows shortcuts
+*.lnk
